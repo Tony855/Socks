@@ -13,8 +13,8 @@ IP_ADDRESSES=($(hostname -I))
 install_xray() {
     echo "安装 Xray..."
     apt-get update
-    apt-get install -y unzip jq python3-pip || yum install -y unzip jq python3-pip
-    wget -q https://github.com/XTLS/Xray-core/releases/download/v25.1.1/Xray-linux-64.zip
+    apt-get install -y unzip jq python3 python3-pip python3-dev || yum install -y unzip jq python3 python3-pip
+    wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
     unzip -q Xray-linux-64.zip
     mv xray /usr/local/bin/xrayL
     chmod +x /usr/local/bin/xrayL
