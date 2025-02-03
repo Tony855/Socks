@@ -1,99 +1,33 @@
-#!/bin/bash
+DEFAULT_START_PORT=23049                         # 默认起始端口
+DEFAULT_SOCKS_USERNAME="socks@admin"             # 固定 SOCKS 账号
+DEFAULT_SOCKS_PASSWORD="1234567890"              # 固定 SOCKS 密码
+DEFAULT_WS_PATH="/ws"                            # 默认 WebSocket 路径
+DEFAULT_UUID=$(cat /proc/sys/kernel/random/uuid) # 默认随机 UUID
 
-# 修复版本：主要解决路径创建问题和服务文件配置
-DEFAULT_START_PORT=23049
-DEFAULT_SOCKS_USERNAME="socks@admin"
-DEFAULT_SOCKS_PASSWORD="1234567890"
-DEFAULT_WS_PATH="/ws"
-DEFAULT_UUID=$(cat /proc/sys/kernel/random/uuid)
-TG_BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
-TG_ADMIN_ID="YOUR_TELEGRAM_ID"
-API_PORT=62789
-XRAYL_DIR="/etc/xrayL"
-CONFIG_FILE="$XRAYL_DIR/config.toml"
-SERVICE_FILE="/etc/systemd/system/xrayL.service"
-STATS_FILE="/var/log/xrayL/stats.json"
+IP_ADDRESSES=($(hostname -I))                    # 获取本机 IP 地址
 
-IP_ADDRESSES=($(hostname -I))
-
-# 创建必要目录
-create_dirs() {
-    echo "创建系统目录..."
-    mkdir -p $XRAYL_DIR
-    mkdir -p /var/log/xrayL
-    mkdir -p /usr/local/bin
-}
-
-install_dependencies() {
-    echo "安装系统依赖..."
-    # 添加EPEL仓库（针对CentOS）
-    if [ -f /etc/redhat-release ]; then
-        yum install -y epel-release
-    fi
-    
-    # 检测包管理器并安装依赖
-    if command -v apt-get >/dev/null; then
-        apt-get update
-        apt-get install -y jq python3 python3-pip unzip wget
-    elif command -v yum >/dev/null; then
-        yum install -y jq python3 python3-pip unzip wget
-    else
-        echo "不支持的Linux发行版"
-        exit 1
-    fi
-    
-    pip3 install python-telegram-bot psutil
-}
-
-get_latest_xray_version() {
-    curl -s "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
-}
-
+# 安装 Xray
 install_xray() {
-    echo "安装最新版 Xray..."
-    
-    # 清理旧版本
-    systemctl stop xrayL.service 2>/dev/null
-    rm -f /usr/local/bin/xrayL
-    rm -f $SERVICE_FILE
+	echo "安装 Xray..."
+	# 安装 unzip（如果未安装）
+	if ! command -v unzip &> /dev/null; then
+		apt-get install unzip -y || yum install unzip -y
+	fi
 
-    # 获取最新版本
-    VERSION=$(get_latest_xray_version)
-    if [ -z "$VERSION" ]; then
-        echo "获取Xray版本失败，使用默认v1.8.11"
-        VERSION="v1.8.11"
-    fi
+	# 下载并安装最新版 Xray
+	wget https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+	unzip Xray-linux-64.zip
+	mv xray /usr/local/bin/xrayL
+	chmod +x /usr/local/bin/xrayL
 
-    # 下载和解压
-    wget -q --show-progress "https://github.com/XTLS/Xray-core/releases/download/$VERSION/Xray-linux-64.zip"
-    if [ ! -f Xray-linux-64.zip ]; then
-        echo "下载Xray失败!"
-        exit 1
-    fi
-    unzip -o Xray-linux-64.zip
-    mv xray /usr/local/bin/xrayL
-    chmod +x /usr/local/bin/xrayL
-
-    # 创建基础配置文件
-    cat <<EOF >$CONFIG_FILE
-# XrayL 基础配置
-[[api]]
-tag = "stats_api"
-services = ["StatsService"]
-
-[[routing]]
-domainStrategy = "AsIs"
-rule = "api"
-EOF
-
-    # 创建服务文件
-    cat <<EOF >$SERVICE_FILE
+	# 创建 Xray 服务文件
+	cat <<EOF >/etc/systemd/system/xrayL.service
 [Unit]
 Description=XrayL Service
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/xrayL run -config $CONFIG_FILE
+ExecStart=/usr/local/bin/xrayL -c /etc/xrayL/config.toml
 Restart=on-failure
 User=nobody
 RestartSec=3
@@ -102,171 +36,124 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable xrayL.service
-    if ! systemctl start xrayL.service; then
-        echo "服务启动失败，查看日志：journalctl -u xrayL.service"
-        exit 1
-    fi
-    echo "Xray 安装完成."
+	# 启动并启用服务
+	systemctl daemon-reload
+	systemctl enable xrayL.service
+	systemctl start xrayL.service
+	echo "Xray 安装完成."
 }
 
-install_tg_bot() {
-    cat <<EOF >/usr/local/bin/xrayL_bot.py
-import os
-import json
-import psutil
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
-
-CONFIG = {
-    'bot_token': '$TG_BOT_TOKEN',
-    'admin_id': $TG_ADMIN_ID,
-    'stats_file': '$STATS_FILE',
-    'config_file': '$CONFIG_FILE'
-}
-
-def auth_required(func):
-    def wrapper(update: Update, context: CallbackContext):
-        if update.effective_user.id != CONFIG['admin_id']:
-            update.message.reply_text("⛔ 未经授权的访问")
-            return
-        return func(update, context)
-    return wrapper
-
-@auth_required
-def start(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("📊 流量统计", callback_data='stats'),
-         InlineKeyboardButton("📡 网络状态", callback_data='netstats')],
-        [InlineKeyboardButton("⚙️ 端口管理", callback_data='port_mgmt')]
-    ]
-    update.message.reply_text(
-        "XrayL 管理面板\n选择操作:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-def get_traffic_stats():
-    with open(CONFIG['stats_file']) as f:
-        return json.load(f)
-
-def get_network_stats():
-    net_io = psutil.net_io_counters()
-    return f"📤 发送: {net_io.bytes_sent/1024/1024:.2f}MB\n📥 接收: {net_io.bytes_recv/1024/1024:.2f}MB"
-
-def button_handler(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    
-    if query.data == 'stats':
-        stats = get_traffic_stats()
-        msg = "📊 流量统计:\n"
-        for user in stats['users']:
-            msg += f"{user['email']}: ↑{user['up']}MB ↓{user['down']}MB\n"
-        query.edit_message_text(msg)
-    
-    elif query.data == 'netstats':
-        msg = get_network_stats()
-        query.edit_message_text(f"🌐 网络状态:\n{msg}")
-
-def main():
-    updater = Updater(CONFIG['bot_token'])
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CallbackQueryHandler(button_handler))
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == '__main__':
-    if not os.path.exists(CONFIG['stats_file']):
-        with open(CONFIG['stats_file'], 'w') as f:
-            json.dump({"users": []}, f)
-    main()
-EOF
-
-    # 创建Telegram Bot服务
-    cat <<EOF >/etc/systemd/system/xrayL_bot.service
-[Unit]
-Description=XrayL Telegram Bot
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 /usr/local/bin/xrayL_bot.py
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable xrayL_bot.service
-    systemctl start xrayL_bot.service
-}
-
+# 配置 Xray
 config_xray() {
-    # [原有配置函数保持不变...]
-    # 需要添加流量统计功能
-    cat <<EOF >>$CONFIG_FILE
-[[api]]
-tag = "stats_api"
-services = ["StatsService"]
-EOF
+	config_type=$1
+
+	# 创建配置目录
+	if ! mkdir -p /etc/xrayL; then
+		echo "无法创建目录 /etc/xrayL，请检查权限！"
+		exit 1
+	fi
+
+	if [ "$config_type" != "socks" ] && [ "$config_type" != "vmess" ]; then
+		echo "类型错误！仅支持 socks 和 vmess."
+		exit 1
+	fi
+
+	read -p "起始端口 (默认 $DEFAULT_START_PORT): " START_PORT
+	START_PORT=${START_PORT:-$DEFAULT_START_PORT}
+
+	if [ "$config_type" == "socks" ]; then
+		SOCKS_USERNAME=$DEFAULT_SOCKS_USERNAME
+		SOCKS_PASSWORD=$DEFAULT_SOCKS_PASSWORD
+		echo "使用固定 SOCKS 账号: $SOCKS_USERNAME"
+		echo "使用固定 SOCKS 密码: $SOCKS_PASSWORD"
+	elif [ "$config_type" == "vmess" ]; then
+		read -p "UUID (默认随机): " UUID
+		UUID=${UUID:-$DEFAULT_UUID}
+		read -p "WebSocket 路径 (默认 $DEFAULT_WS_PATH): " WS_PATH
+		WS_PATH=${WS_PATH:-$DEFAULT_WS_PATH}
+	fi
+
+	config_content=""
+	for ((i = 0; i < ${#IP_ADDRESSES[@]}; i++)); do
+		config_content+="[[inbounds]]\n"
+		config_content+="port = $((START_PORT + i))\n"
+		config_content+="protocol = \"$config_type\"\n"
+		config_content+="tag = \"tag_$((i + 1))\"\n"
+		config_content+="[inbounds.settings]\n"
+		if [ "$config_type" == "socks" ]; then
+			config_content+="auth = \"password\"\n"
+			config_content+="udp = true\n"
+			config_content+="tcp = true\n"
+			config_content+="ip = \"${IP_ADDRESSES[i]}\"\n"
+			config_content+="[[inbounds.settings.accounts]]\n"
+			config_content+="user = \"$SOCKS_USERNAME\"\n"
+			config_content+="pass = \"$SOCKS_PASSWORD\"\n"
+		elif [ "$config_type" == "vmess" ]; then
+			config_content+="[[inbounds.settings.clients]]\n"
+			config_content+="id = \"$UUID\"\n"
+			config_content+="[inbounds.streamSettings]\n"
+			config_content+="network = \"ws\"\n"
+			config_content+="[inbounds.streamSettings.wsSettings]\n"
+			config_content+="path = \"$WS_PATH\"\n\n"
+		fi
+		config_content+="[[outbounds]]\n"
+		config_content+="sendThrough = \"${IP_ADDRESSES[i]}\"\n"
+		config_content+="protocol = \"freedom\"\n"
+		config_content+="tag = \"tag_$((i + 1))\"\n\n"
+		config_content+="[[routing.rules]]\n"
+		config_content+="type = \"field\"\n"
+		config_content+="inboundTag = \"tag_$((i + 1))\"\n"
+		config_content+="outboundTag = \"tag_$((i + 1))\"\n\n\n"
+	done
+
+	# 写入配置文件
+	if ! echo -e "$config_content" >/etc/xrayL/config.toml; then
+		echo "无法写入配置文件 /etc/xrayL/config.toml，请检查权限！"
+		exit 1
+	fi
+
+	systemctl restart xrayL.service
+	systemctl --no-pager status xrayL.service
+
+	# 输出配置信息
+	echo ""
+	echo "生成 $config_type 配置完成"
+	echo "起始端口: $START_PORT"
+	echo "结束端口: $(($START_PORT + ${#IP_ADDRESSES[@]} - 1))"
+	if [ "$config_type" == "socks" ]; then
+		echo "SOCKS 账号: $SOCKS_USERNAME"
+		echo "SOCKS 密码: $SOCKS_PASSWORD"
+	elif [ "$config_type" == "vmess" ]; then
+		echo "UUID: $UUID"
+		echo "WebSocket 路径: $WS_PATH"
+	fi
+	echo ""
 }
 
-manage_ports() {
-    echo "端口管理:"
-    echo "1. 启用端口"
-    echo "2. 禁用端口"
-    read -p "选择操作: " action
-    case $action in
-        1) enable_port ;;
-        2) disable_port ;;
-        *) echo "无效选择";;
-    esac
-}
+# 主函数
+main() {
+	# 检查 Xray 是否已安装，如果未安装则安装
+	if ! command -v xrayL &> /dev/null; then
+		install_xray
+	fi
 
-enable_port() {
-    read -p "输入要启用的端口: " port
-    sed -i "/\"$port\"/s/\"disabled\": true/\"disabled\": false/" $CONFIG_FILE
-    systemctl restart xrayL
-}
+	# 获取配置类型
+	if [ $# -eq 1 ]; then
+		config_type="$1"
+	else
+		read -p "选择生成的节点类型 (socks/vmess): " config_type
+	fi
 
-disable_port() {
-    read -p "输入要禁用的端口: " port
-    sed -i "/\"$port\"/s/\"disabled\": false/\"disabled\": true/" $CONFIG_FILE
-    systemctl restart xrayL
-}
-
-main_menu() {
-    while true; do
-        echo -e "\nXrayL 管理面板"
-        echo "1. 查看流量统计"
-        echo "2. 查看网络状态"
-        echo "3. 管理端口"
-        echo "4. 退出"
-        read -p "选择操作: " choice
-        case $choice in
-            1) show_traffic ;;
-            2) show_network ;;
-            3) manage_ports ;;
-            4) exit 0 ;;
-            *) echo "无效选择";;
-        esac
-    done
-}
-
-show_traffic() {
-    curl -s http://127.0.0.1:$API_PORT/stats | jq '.stat'
-}
-
-show_network() {
-    ifconfig | grep -A 1 $(ip route | grep default | awk '{print $5}')
+	# 根据配置类型生成配置
+	if [ "$config_type" == "vmess" ]; then
+		config_xray "vmess"
+	elif [ "$config_type" == "socks" ]; then
+		config_xray "socks"
+	else
+		echo "未正确选择类型，使用默认 SOCKS 配置."
+		config_xray "socks"
+	fi
 }
 
 # 执行主函数
-install_dependencies
-[ -x "$(command -v xrayL)" ] || install_xray
-[ -f "/usr/local/bin/xrayL_bot.py" ] || install_tg_bot
-config_xray
-main_menu
+main "$@"
