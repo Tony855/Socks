@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# 修复版本：主要解决路径创建问题和服务文件配置
 DEFAULT_START_PORT=23049
 DEFAULT_SOCKS_USERNAME="socks@admin"
 DEFAULT_SOCKS_PASSWORD="1234567890"
@@ -8,16 +9,39 @@ DEFAULT_UUID=$(cat /proc/sys/kernel/random/uuid)
 TG_BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
 TG_ADMIN_ID="YOUR_TELEGRAM_ID"
 API_PORT=62789
-CONFIG_FILE="/etc/xrayL/config.toml"
+XRAYL_DIR="/etc/xrayL"
+CONFIG_FILE="$XRAYL_DIR/config.toml"
 SERVICE_FILE="/etc/systemd/system/xrayL.service"
 STATS_FILE="/var/log/xrayL/stats.json"
 
 IP_ADDRESSES=($(hostname -I))
 
+# 创建必要目录
+create_dirs() {
+    echo "创建系统目录..."
+    mkdir -p $XRAYL_DIR
+    mkdir -p /var/log/xrayL
+    mkdir -p /usr/local/bin
+}
+
 install_dependencies() {
     echo "安装系统依赖..."
-    apt-get update || yum update -y
-    apt-get install -y jq python3 python3-pip unzip wget || yum install -y jq python3 python3-pip unzip wget
+    # 添加EPEL仓库（针对CentOS）
+    if [ -f /etc/redhat-release ]; then
+        yum install -y epel-release
+    fi
+    
+    # 检测包管理器并安装依赖
+    if command -v apt-get >/dev/null; then
+        apt-get update
+        apt-get install -y jq python3 python3-pip unzip wget
+    elif command -v yum >/dev/null; then
+        yum install -y jq python3 python3-pip unzip wget
+    else
+        echo "不支持的Linux发行版"
+        exit 1
+    fi
+    
     pip3 install python-telegram-bot psutil
 }
 
@@ -27,28 +51,63 @@ get_latest_xray_version() {
 
 install_xray() {
     echo "安装最新版 Xray..."
+    
+    # 清理旧版本
+    systemctl stop xrayL.service 2>/dev/null
+    rm -f /usr/local/bin/xrayL
+    rm -f $SERVICE_FILE
+
+    # 获取最新版本
     VERSION=$(get_latest_xray_version)
-    wget "https://github.com/XTLS/Xray-core/releases/download/$VERSION/Xray-linux-64.zip"
-    unzip Xray-linux-64.zip
+    if [ -z "$VERSION" ]; then
+        echo "获取Xray版本失败，使用默认v1.8.11"
+        VERSION="v1.8.11"
+    fi
+
+    # 下载和解压
+    wget -q --show-progress "https://github.com/XTLS/Xray-core/releases/download/$VERSION/Xray-linux-64.zip"
+    if [ ! -f Xray-linux-64.zip ]; then
+        echo "下载Xray失败!"
+        exit 1
+    fi
+    unzip -o Xray-linux-64.zip
     mv xray /usr/local/bin/xrayL
     chmod +x /usr/local/bin/xrayL
 
-    # 创建API配置
-    cat <<EOF >>$CONFIG_FILE
-[[inbounds]]
-port = $API_PORT
-protocol = "dokodemo-door"
-tag = "api"
-[[inbounds.settings]]
-address = "127.0.0.1"
-[[routing.api]]
-tag = "api"
+    # 创建基础配置文件
+    cat <<EOF >$CONFIG_FILE
+# XrayL 基础配置
+[[api]]
+tag = "stats_api"
+services = ["StatsService"]
+
+[[routing]]
+domainStrategy = "AsIs"
 rule = "api"
+EOF
+
+    # 创建服务文件
+    cat <<EOF >$SERVICE_FILE
+[Unit]
+Description=XrayL Service
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/xrayL run -config $CONFIG_FILE
+Restart=on-failure
+User=nobody
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
     systemctl enable xrayL.service
-    systemctl start xrayL.service
+    if ! systemctl start xrayL.service; then
+        echo "服务启动失败，查看日志：journalctl -u xrayL.service"
+        exit 1
+    fi
     echo "Xray 安装完成."
 }
 
