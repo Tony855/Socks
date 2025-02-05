@@ -1,29 +1,18 @@
-#!/bin/bash
-
 DEFAULT_START_PORT=23049
 DEFAULT_SOCKS_USERNAME="socks@admin"
 DEFAULT_SOCKS_PASSWORD="1234567890"
 DEFAULT_WS_PATH="/ws"
 DEFAULT_UUID=$(cat /proc/sys/kernel/random/uuid)
-STATS_API_PORT=23333
-LOG_PATH="/var/log/xrayL_traffic.log"
 
 IP_ADDRESSES=($(hostname -I))
 
 install_xray() {
-    echo "安装最新版 Xray..."
-    apt-get update
-    apt-get install -y jq unzip curl || yum install -y jq unzip
-    
-    # 使用官方最新版（请自行检查更新地址）
-    LATEST_URL="https://github.com/XTLS/Xray-core/releases/download/v25.1.30/Xray-linux-64.zip"
-    
-    wget -O xray.zip ${LATEST_URL}
-    unzip xray.zip
+    echo "安装 Xray..."
+    apt-get install unzip -y || yum install unzip -y
+    wget https://github.com/XTLS/Xray-core/releases/download/v25.1.30/Xray-linux-64.zip
+    unzip Xray-linux-64.zip
     mv xray /usr/local/bin/xrayL
     chmod +x /usr/local/bin/xrayL
-
-    # 创建服务文件
     cat <<EOF >/etc/systemd/system/xrayL.service
 [Unit]
 Description=XrayL Service
@@ -38,177 +27,103 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    # 创建日志目录
-    mkdir -p /var/log/xrayL
-    touch ${LOG_PATH}
-    chown nobody:nogroup ${LOG_PATH}
-
     systemctl daemon-reload
-    systemctl enable xrayL
-    echo "Xray 安装完成"
+    systemctl enable xrayL.service
+    systemctl start xrayL.service
+    echo "Xray 安装完成."
 }
 
 config_xray() {
     config_type=$1
     mkdir -p /etc/xrayL
-    
-    # 清空旧配置
-    > /etc/xrayL/config.toml
-    > /etc/xrayL/port_mapping
+    [ -f "/etc/xrayL/config.toml" ] && rm -f /etc/xrayL/config.toml
 
-    # 基础配置
-    cat <<EOF >>/etc/xrayL/config.toml
-[log]
-loglevel = "warning"
-access = "/var/log/xrayL/access.log"
+    # 添加统计和API配置
+    config_content="[stats]\nenabled = true\n\n[api]\nservices = [\"StatsService\"]\ntag = \"api\"\n\n[[inbounds]]\nport = 8080\nprotocol = \"dokodemo-door\"\ntag = \"api\"\n[inbounds.settings]\naddress = \"127.0.0.1\"\n\n"
 
-[stats]
-[[api]]
-tag = "stats_api"
-services = ["StatsService"]
-EOF
+    read -p "起始端口 (默认 $DEFAULT_START_PORT): " START_PORT
+    START_PORT=${START_PORT:-$DEFAULT_START_PORT}
 
-    # 生成节点配置
-    for ((i=0; i<${#IP_ADDRESSES[@]}; i++)); do
-        PORT=$((DEFAULT_START_PORT + i))
-        TAG="tag_${IP_ADDRESSES[i]}_${PORT}"
+    if [ "$config_type" == "socks" ]; then
+        read -p "SOCKS 账号 (默认 $DEFAULT_SOCKS_USERNAME): " SOCKS_USERNAME
+        SOCKS_USERNAME=${SOCKS_USERNAME:-$DEFAULT_SOCKS_USERNAME}
 
-        # 记录端口映射
-        echo "${TAG}|${IP_ADDRESSES[i]}|${PORT}" >> /etc/xrayL/port_mapping
+        read -p "SOCKS 密码 (默认 $DEFAULT_SOCKS_PASSWORD): " SOCKS_PASSWORD
+        SOCKS_PASSWORD=${SOCKS_PASSWORD:-$DEFAULT_SOCKS_PASSWORD}
+    elif [ "$config_type" == "vmess" ]; then
+        read -p "UUID (默认随机): " UUID
+        UUID=${UUID:-$DEFAULT_UUID}
+        read -p "WebSocket 路径 (默认 $DEFAULT_WS_PATH): " WS_PATH
+        WS_PATH=${WS_PATH:-$DEFAULT_WS_PATH}
+    fi
 
-        # 入站配置
-        cat <<EOF >>/etc/xrayL/config.toml
-
-[[inbounds]]
-port = ${PORT}
-protocol = "${config_type}"
-tag = "${TAG}"
-listen = "${IP_ADDRESSES[i]}"
-EOF
-
-        # 协议配置
-        if [ "${config_type}" == "socks" ]; then
-            cat <<EOF >>/etc/xrayL/config.toml
-[inbounds.settings]
-auth = "password"
-udp = true
-ip = "${IP_ADDRESSES[i]}"
-[[inbounds.settings.accounts]]
-user = "${DEFAULT_SOCKS_USERNAME}"
-pass = "${DEFAULT_SOCKS_PASSWORD}"
-EOF
-        elif [ "${config_type}" == "vmess" ]; then
-            cat <<EOF >>/etc/xrayL/config.toml
-[inbounds.settings]
-[[inbounds.settings.clients]]
-id = "${DEFAULT_UUID}"
-[inbounds.streamSettings]
-network = "ws"
-[inbounds.streamSettings.wsSettings] 
-path = "${DEFAULT_WS_PATH}"
-EOF
+    for ((i = 0; i < ${#IP_ADDRESSES[@]}; i++)); do
+        current_tag="tag_$((i + 1))"
+        config_content+="[[inbounds]]\n"
+        config_content+="port = $((START_PORT + i))\n"
+        config_content+="protocol = \"$config_type\"\n"
+        config_content+="tag = \"$current_tag\"\n"
+        config_content+="[inbounds.settings]\n"
+        if [ "$config_type" == "socks" ]; then
+            config_content+="auth = \"password\"\n"
+            config_content+="udp = true\n"
+            config_content+="ip = \"${IP_ADDRESSES[i]}\"\n"
+            config_content+="[[inbounds.settings.accounts]]\n"
+            config_content+="user = \"$SOCKS_USERNAME\"\n"
+            config_content+="pass = \"$SOCKS_PASSWORD\"\n"
+        elif [ "$config_type" == "vmess" ]; then
+            config_content+="[[inbounds.settings.clients]]\n"
+            config_content+="id = \"$UUID\"\n"
+            config_content+="[inbounds.streamSettings]\n"
+            config_content+="network = \"ws\"\n"
+            config_content+="[inbounds.streamSettings.wsSettings]\n"
+            config_content+="path = \"$WS_PATH\"\n\n"
         fi
-
-        # 出站配置
-        cat <<EOF >>/etc/xrayL/config.toml
-
-[[outbounds]]
-protocol = "freedom"
-tag = "${TAG}"
-sendThrough = "${IP_ADDRESSES[i]}"
-EOF
+        config_content+="[[outbounds]]\n"
+        config_content+="sendThrough = \"${IP_ADDRESSES[i]}\"\n"
+        config_content+="protocol = \"freedom\"\n"
+        config_content+="tag = \"$current_tag\"\n\n"
+        config_content+="[[routing.rules]]\n"
+        config_content+="type = \"field\"\n"
+        config_content+="inboundTag = \"$current_tag\"\n"
+        config_content+="outboundTag = \"$current_tag\"\n\n"
     done
 
-    # API入站配置
-    cat <<EOF >>/etc/xrayL/config.toml
+    echo -e "$config_content" >/etc/xrayL/config.toml
+    systemctl restart xrayL.service
 
-[[inbounds]]
-port = ${STATS_API_PORT}
-protocol = "dokodemo-door"
-tag = "api"
-[inbounds.settings]
-address = "127.0.0.1"
-[[routing.rules]]
-type = "field"
-inboundTag = ["api"]
-outboundTag = "api"
-
-[[outbounds]]
-protocol = "api"
-tag = "api"
-EOF
-
-    systemctl restart xrayL
-    enable_traffic_log
-}
-
-enable_traffic_log() {
-    # 创建流量统计脚本
-    cat <<'EOF' > /usr/local/bin/xray_traffic.sh
-#!/bin/bash
-API_URL="http://127.0.0.1:${STATS_API_PORT}/stat?reset=true"
-while read LINE; do
-    TAG=$(echo ${LINE} | cut -d'|' -f1)
-    IP=$(echo ${LINE} | cut -d'|' -f2)
-    PORT=$(echo ${LINE} | cut -d'|' -f3)
+    echo -e "\n生成配置完成！"
+    echo "起始端口: $START_PORT"
+    echo "结束端口: $(($START_PORT + ${#IP_ADDRESSES[@]} - 1))"
+    [ "$config_type" == "socks" ] && echo "SOCKS账号: $SOCKS_USERNAME" && echo "SOCKS密码: $SOCKS_PASSWORD"
+    [ "$config_type" == "vmess" ] && echo "UUID: $UUID" && echo "WS路径: $WS_PATH"
     
-    TRAFFIC=$(curl -s ${API_URL} | jq -r ".data[] | select(.name == \"outbound>>>${TAG}>>>traffic>>>downlink\") | .value")
-    echo "[$(date +'%F %T')] ${IP}:${PORT} 累计流量: ${TRAFFIC} bytes" >> ${LOG_PATH}
-done < /etc/xrayL/port_mapping
-EOF
-
-    chmod +x /usr/local/bin/xray_traffic.sh
-
-    # 添加定时任务
-    (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/xray_traffic.sh") | crontab -
+    echo -e "\n流量统计已启用，可通过以下方式查询："
+    echo "1. 使用API端口8080（本地访问）"
+    echo "2. 查询命令示例："
+    for ((i = 0; i < ${#IP_ADDRESSES[@]}; i++)); do
+        echo "curl -s http://127.0.0.1:8080/stat/query?pattern=inbound>>>tag_$((i+1))>>>traffic>>>downlink"
+    done
+    echo -e "\n注意：统计信息需要产生流量后才会显示，实时流量请使用Xray API文档推荐方式查询。"
 }
 
 main() {
-    [ -x "/usr/local/bin/xrayL" ] || install_xray
-    
+    [ -x "$(command -v xrayL)" ] || install_xray
     if [ $# -eq 1 ]; then
         config_type="$1"
     else
-        read -p "请选择代理类型 (socks/vmess): " config_type
+        read -p "选择生成的节点类型 (socks/vmess): " config_type
     fi
-
-    case "${config_type}" in
+    
+    case "$config_type" in
         socks|vmess)
-            config_xray "${config_type}"
-            show_config "${config_type}"
+            config_xray "$config_type"
             ;;
         *)
-            echo "无效类型！使用默认socks配置"
+            echo "类型错误！使用默认socks配置。"
             config_xray "socks"
-            show_config "socks"
             ;;
     esac
-}
-
-show_config() {
-    echo ""
-    echo "====== 节点配置信息 ======"
-    echo "类型: $1"
-    echo "IP列表: ${IP_ADDRESSES[*]}"
-    echo "端口范围: ${DEFAULT_START_PORT} - $((${DEFAULT_START_PORT} + ${#IP_ADDRESSES[@]} - 1))"
-    
-    case "$1" in
-        socks)
-            echo "用户名: ${DEFAULT_SOCKS_USERNAME}"
-            echo "密码: ${DEFAULT_SOCKS_PASSWORD}"
-            ;;
-        vmess)
-            echo "UUID: ${DEFAULT_UUID}"
-            echo "WS路径: ${DEFAULT_WS_PATH}"
-            ;;
-    esac
-    
-    echo ""
-    echo "====== 流量统计 ======"
-    echo "日志文件: ${LOG_PATH}"
-    echo "查看命令: tail -f ${LOG_PATH}"
-    echo ""
 }
 
 main "$@"
