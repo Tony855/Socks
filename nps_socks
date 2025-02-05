@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# 配置参数
 DEFAULT_START_PORT=23049
 DEFAULT_SOCKS_USERNAME="socks@admin"
 DEFAULT_SOCKS_PASSWORD="1234567890"
@@ -7,40 +8,64 @@ DEFAULT_WS_PATH="/ws"
 DEFAULT_UUID=$(cat /proc/sys/kernel/random/uuid)
 DEFAULT_EXPIRE_DAYS=30
 
-IP_ADDRESSES=($(hostname -I))
-STATS_FILE="/etc/xrayL/ip_stats.json"
-NPS_OUTPUT_FILE="/var/www/html/nps_stats.txt"
+# 路径配置
+CONFIG_DIR="/etc/xrayL"
+STATS_FILE="$CONFIG_DIR/ip_stats.json"
+NPS_OUTPUT_DIR="/var/www/html"
+NPS_OUTPUT_FILE="$NPS_OUTPUT_DIR/nps_stats.txt"
+XRAY_BIN="/usr/local/bin/xrayL"
 
+# 获取本机IP
+IP_ADDRESSES=($(hostname -I))
+
+# 安装依赖
 install_dependencies() {
-    echo "安装依赖..."
-    apt-get update || yum update -y
-    apt-get install -y jq curl unzip || yum install -y jq curl unzip
+    echo "安装系统依赖..."
+    if [ -x "$(command -v apt-get)" ]; then
+        apt-get update
+        apt-get install -y jq curl unzip
+    elif [ -x "$(command -v yum)" ]; then
+        yum update -y
+        yum install -y jq curl unzip
+    else
+        echo "不支持的包管理器！"
+        exit 1
+    fi
 }
 
-install_xray() {
-    echo "安装 Xray..."
-    install_dependencies
-     mkdir -p /etc/xrayL  # 新增目录创建保障
-    [ -f "$STATS_FILE" ] || echo "[]" > "$STATS_FILE"  # 强化文件创建
-    
-    wget https://github.com/XTLS/Xray-core/releases/download/v25.1.1/Xray-linux-64.zip
-    unzip Xray-linux-64.zip
-    mv xray /usr/local/bin/xrayL
-    chmod +x /usr/local/bin/xrayL
-    
-    # 初始化统计文件
+# 初始化文件系统
+init_filesystem() {
+    mkdir -p "$CONFIG_DIR" "$NPS_OUTPUT_DIR"
     [ -f "$STATS_FILE" ] || echo "[]" > "$STATS_FILE"
-    
+    chmod 600 "$STATS_FILE"
+    chown nobody:nogroup "$CONFIG_DIR" "$STATS_FILE"
+}
+
+# 安装Xray核心
+install_xray() {
+    echo "正在安装 Xray..."
+    init_filesystem
+
+    if [ ! -f "$XRAY_BIN" ]; then
+        wget -q https://github.com/XTLS/Xray-core/releases/download/v25.1.1/Xray-linux-64.zip
+        unzip -q Xray-linux-64.zip
+        mv xray "$XRAY_BIN"
+        chmod +x "$XRAY_BIN"
+        rm -f Xray-linux-64.zip
+    fi
+
+    # 服务文件配置
     cat <<EOF >/etc/systemd/system/xrayL.service
 [Unit]
 Description=XrayL Service
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/xrayL -c /etc/xrayL/config.toml
+ExecStart=$XRAY_BIN -c $CONFIG_DIR/config.toml
 Restart=on-failure
 User=nobody
 RestartSec=3
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -52,8 +77,9 @@ EOF
     echo "Xray 安装完成."
 }
 
+# 生成基础配置模板
 generate_base_config() {
-    cat <<EOF >/etc/xrayL/config.toml
+    cat <<EOF >$CONFIG_DIR/config.toml
 [stats]
 [[stats.rules]]
 type = "user"
@@ -71,15 +97,15 @@ port = 10085
 EOF
 }
 
+# 更新统计记录
 update_stats() {
     local tag=$1
     local ip=$2
     local port=$3
     local expire_date=$4
-    
-    # 新增目录和文件创建保障
-    mkdir -p /etc/xrayL
-    [ -f "$STATS_FILE" ] || echo "[]" > "$STATS_FILE"
+
+    # 双重保障机制
+    init_filesystem
 
     existing=$(jq --arg tag "$tag" '.[] | select(.tag == $tag)' "$STATS_FILE")
     if [ -z "$existing" ]; then
@@ -87,23 +113,25 @@ update_stats() {
             \"tag\": \"$tag\", \
             \"ip\": \"$ip\", \
             \"port\": $port, \
-            \"start_time\": \"$(date +%Y-%m-%d)\", \
+            \"start_time\": \"$(date +%Y-%m-%dT%H:%M:%S%:z)\", \
             \"expire_time\": \"$expire_date\", \
             \"upload\": 0, \
-            \"download\": 0 \
+            \"download\": 0, \
+            \"enable\": true \
         }" '. += [$new_entry]' "$STATS_FILE" > tmp.json && mv tmp.json "$STATS_FILE"
     fi
 }
+
+# 配置Xray服务
 config_xray() {
-    config_type=$1
-    mkdir -p /etc/xrayL  # 新增目录创建保障
-    [ -f "$STATS_FILE" ] || echo "[]" > "$STATS_FILE"  # 新增文件创建保障
-    
+    local config_type=$1
+    init_filesystem
     generate_base_config
-    
+
+    # 用户输入配置
     read -p "起始端口 (默认 $DEFAULT_START_PORT): " START_PORT
     START_PORT=${START_PORT:-$DEFAULT_START_PORT}
-    
+
     if [ "$config_type" == "socks" ]; then
         read -p "SOCKS 账号 (默认 $DEFAULT_SOCKS_USERNAME): " SOCKS_USERNAME
         SOCKS_USERNAME=${SOCKS_USERNAME:-$DEFAULT_SOCKS_USERNAME}
@@ -115,26 +143,26 @@ config_xray() {
         read -p "WebSocket 路径 (默认 $DEFAULT_WS_PATH): " WS_PATH
         WS_PATH=${WS_PATH:-$DEFAULT_WS_PATH}
     fi
-    
+
     read -p "有效期天数 (默认 $DEFAULT_EXPIRE_DAYS): " EXPIRE_DAYS
     EXPIRE_DAYS=${EXPIRE_DAYS:-$DEFAULT_EXPIRE_DAYS}
     expire_date=$(date -d "+${EXPIRE_DAYS} days" +%Y-%m-%d)
-    
+
+    # 生成配置
     config_content=""
     for ((i = 0; i < ${#IP_ADDRESSES[@]}; i++)); do
         current_port=$((START_PORT + i))
         current_tag="tag_$((i + 1))"
         current_ip=${IP_ADDRESSES[i]}
-        
-        # 更新统计信息
+
         update_stats "$current_tag" "$current_ip" "$current_port" "$expire_date"
-        
+
         config_content+="[[inbounds]]\n"
         config_content+="port = $current_port\n"
         config_content+="protocol = \"$config_type\"\n"
         config_content+="tag = \"$current_tag\"\n"
         config_content+="[inbounds.settings]\n"
-        
+
         if [ "$config_type" == "socks" ]; then
             config_content+="auth = \"password\"\n"
             config_content+="udp = true\n"
@@ -150,36 +178,37 @@ config_xray() {
             config_content+="[inbounds.streamSettings.wsSettings]\n"
             config_content+="path = \"$WS_PATH\"\n"
         fi
-        
+
         config_content+="[[outbounds]]\n"
         config_content+="sendThrough = \"$current_ip\"\n"
         config_content+="protocol = \"freedom\"\n"
         config_content+="tag = \"$current_tag\"\n"
-        
+
         config_content+="[[routing.rules]]\n"
         config_content+="type = \"field\"\n"
         config_content+="inboundTag = \"$current_tag\"\n"
         config_content+="outboundTag = \"$current_tag\"\n\n"
     done
-    
-    echo -e "$config_content" >>/etc/xrayL/config.toml
+
+    echo -e "$config_content" >>$CONFIG_DIR/config.toml
     systemctl restart xrayL
-    
-    # 添加统计脚本
+
+    # 部署统计脚本
     cat <<'EOF' >/usr/local/bin/xray_stats.sh
 #!/bin/bash
-API_URL="http://127.0.0.1:10085"
+API_URL="http://127.0.0.1:10085/stats?pattern=user>>>"
 STATS_FILE="/etc/xrayL/ip_stats.json"
+NPS_FILE="/var/www/html/nps_stats.txt"
 
 # 获取统计数据
-stats=$(curl -s "$API_URL/stats?pattern=user>>>" | jq -r '.stat[] | select(.name | endswith(":uplink") or endswith(":downlink")) | "\(.name)=\(.value)"')
+stats=$(curl -s "$API_URL" | jq -r '.stat[] | "\(.name)=\(.value)"')
 
 declare -A uploads
 declare -A downloads
 
 while IFS="=" read -r name value; do
     tag=$(echo "$name" | cut -d':' -f1)
-    type=$(echo "$name" | cut -d':' -f2)
+    type=$(echo "$name" | cut -d':' -f2 | sed 's/>//g')
     if [ "$type" == "uplink" ]; then
         uploads["$tag"]=$value
     elif [ "$type" == "downlink" ]; then
@@ -188,49 +217,58 @@ while IFS="=" read -r name value; do
 done <<< "$stats"
 
 # 更新统计文件
-jq --argjson uploads "$(declare -p uploads | jq -c)" --argjson downloads "$(declare -p downloads | jq -c)" '
-    .[] |= (
+jq --argjson uploads "$(declare -p uploads | jq -c)" \
+   --argjson downloads "$(declare -p downloads | jq -c)" \
+   'map(
         .tag as $tag |
-        .upload = ($uploads[$tag] // 0) |
-        .download = ($downloads[$tag] // 0)
+        .upload = ($uploads[$tag] // .upload) |
+        .download = ($downloads[$tag] // .download) |
+        .enable = (if .expire_time < now|strftime("%Y-%m-%d") then false else true end)
     )' "$STATS_FILE" > tmp.json && mv tmp.json "$STATS_FILE"
 
-# 生成NPS输出
-jq -r '.[] | "IP: \(.ip), Port: \(.port), Upload: \(.upload), Download: \(.download), Expiry: \(.expire_time)"' "$STATS_FILE" > "$NPS_OUTPUT_FILE"
+# 生成NPS报告
+jq -r '.[] | select(.enable) | "IP: \(.ip), Port: \(.port), Upload: \(.upload|tonumber/1024/1024|floor)MB, Download: \(.download|tonumber/1024/1024|floor)MB, Expiry: \(.expire_time)"' "$STATS_FILE" > "$NPS_FILE"
 EOF
 
     chmod +x /usr/local/bin/xray_stats.sh
     (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/xray_stats.sh") | crontab -
-    
-    echo "配置完成！"
+
+    # 显示配置信息
+    echo -e "\n\033[32m[配置成功]\033[0m"
+    echo "协议类型: $config_type"
     echo "IP数量: ${#IP_ADDRESSES[@]}"
-    echo "起始端口: $START_PORT"
-    echo "结束端口: $((START_PORT + ${#IP_ADDRESSES[@]} - 1))"
+    echo "端口范围: $START_PORT - $((START_PORT + ${#IP_ADDRESSES[@]} - 1))"
     [ "$config_type" == "socks" ] && echo "用户名: $SOCKS_USERNAME" && echo "密码: $SOCKS_PASSWORD"
     [ "$config_type" == "vmess" ] && echo "UUID: $UUID" && echo "WS路径: $WS_PATH"
     echo "有效期至: $expire_date"
     echo "统计文件: $STATS_FILE"
-    echo "NPS输出文件: $NPS_OUTPUT_FILE"
+    echo "监控报告: $NPS_OUTPUT_FILE"
 }
 
+# 主菜单
 main() {
-    [ -x "$(command -v xrayL)" ] || install_xray
-    if [ $# -ge 1 ]; then
-        config_type="$1"
-    else
-        read -p "选择节点类型 (socks/vmess): " config_type
-    fi
-    config_type=${config_type:-"socks"}
+    echo -e "\n\033[34mXray 多IP管理脚本 v2.1\033[0m"
+    echo "--------------------------------"
     
-    case "$config_type" in
-        socks|vmess)
-            config_xray "$config_type"
-            ;;
-        *)
-            echo "无效类型！使用默认socks配置"
-            config_xray "socks"
-            ;;
-    esac
+    # 环境检查
+    if [ ! -f "$XRAY_BIN" ]; then
+        echo -e "\033[33m检测到未安装Xray，开始安装...\033[0m"
+        install_dependencies
+        install_xray
+    fi
+
+    # 选择协议类型
+    PS3="请选择操作 (1-3): "
+    options=("配置SOCKS5代理" "配置VMESS代理" "退出")
+    select opt in "${options[@]}"; do
+        case $REPLY in
+            1) config_xray "socks"; break ;;
+            2) config_xray "vmess"; break ;;
+            3) exit 0 ;;
+            *) echo "无效选项，请重新选择";;
+        esac
+    done
 }
 
+# 脚本入口
 main "$@"
