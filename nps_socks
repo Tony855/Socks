@@ -20,7 +20,10 @@ install_dependencies() {
 install_xray() {
     echo "安装 Xray..."
     install_dependencies
-    wget https://github.com/XTLS/Xray-core/releases/download/v25.1.30/Xray-linux-64.zip
+     mkdir -p /etc/xrayL  # 新增目录创建保障
+    [ -f "$STATS_FILE" ] || echo "[]" > "$STATS_FILE"  # 强化文件创建
+    
+    wget https://github.com/XTLS/Xray-core/releases/download/v25.1.1/Xray-linux-64.zip
     unzip Xray-linux-64.zip
     mv xray /usr/local/bin/xrayL
     chmod +x /usr/local/bin/xrayL
@@ -74,6 +77,10 @@ update_stats() {
     local port=$3
     local expire_date=$4
     
+    # 新增目录和文件创建保障
+    mkdir -p /etc/xrayL
+    [ -f "$STATS_FILE" ] || echo "[]" > "$STATS_FILE"
+
     existing=$(jq --arg tag "$tag" '.[] | select(.tag == $tag)' "$STATS_FILE")
     if [ -z "$existing" ]; then
         jq --argjson new_entry "{ \
@@ -87,10 +94,10 @@ update_stats() {
         }" '. += [$new_entry]' "$STATS_FILE" > tmp.json && mv tmp.json "$STATS_FILE"
     fi
 }
-
 config_xray() {
     config_type=$1
-    mkdir -p /etc/xrayL
+    mkdir -p /etc/xrayL  # 新增目录创建保障
+    [ -f "$STATS_FILE" ] || echo "[]" > "$STATS_FILE"  # 新增文件创建保障
     
     generate_base_config
     
