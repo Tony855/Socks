@@ -16,7 +16,7 @@ install_xray() {
     apt-get install -y jq unzip || yum install -y jq unzip
     
     # 使用官方最新版（请自行检查更新地址）
-    LATEST_URL="https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip"
+    LATEST_URL="https://github.com/XTLS/Xray-core/releases/download/v25.1.30/Xray-linux-64.zip"
     
     wget -O xray.zip ${LATEST_URL}
     unzip xray.zip
