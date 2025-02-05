@@ -13,7 +13,7 @@ IP_ADDRESSES=($(hostname -I))
 install_xray() {
     echo "安装最新版 Xray..."
     apt-get update
-    apt-get install -y jq unzip || yum install -y jq unzip
+    apt-get install -y jq unzip curl || yum install -y jq unzip
     
     # 使用官方最新版（请自行检查更新地址）
     LATEST_URL="https://github.com/XTLS/Xray-core/releases/download/v25.1.30/Xray-linux-64.zip"
