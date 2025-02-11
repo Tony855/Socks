@@ -171,14 +171,37 @@ stats() {
     echo "流量统计请查看日志或使用Xray API进行查询。"
 }
 
+clean_logs() {
+    read -p "请输入要保留日志的天数（默认7天）: " keep_days
+    keep_days=${keep_days:-7}
+    
+    # 创建自动清理脚本
+    cat <<EOF > /etc/xrayL/cleanlog.sh
+#!/bin/bash
+# 自动删除超过指定天数的日志
+find /var/log/xrayL -name "*.log" -type f -mtime +$keep_days -delete
+EOF
+
+    chmod +x /etc/xrayL/cleanlog.sh
+    
+    # 添加cron任务（每天凌晨3点执行）
+    (crontab -l 2>/dev/null | grep -v "/etc/xrayL/cleanlog.sh"; echo "0 3 * * * /etc/xrayL/cleanlog.sh") | crontab -
+    
+    echo "已设置每天自动清理$keep_days天前的日志"
+}
+
 main() {
     if [ "$1" == "stats" ]; then
         stats
+        exit 0
+    elif [ "$1" == "clean" ]; then  # 新增清理命令
+        clean_logs
         exit 0
     fi
     
     [ -x "$(command -v xrayL)" ] || install_xray
     
+    # 在配置完成后询问是否设置自动清理
     if [ $# -eq 1 ]; then
         config_type="$1"
     else
@@ -190,6 +213,13 @@ main() {
         vmess) config_xray "vmess" ;;
         *) echo "未正确选择类型，使用默认socks配置."; config_xray "socks" ;;
     esac
+    
+    # 新增自动清理设置询问
+    read -p "是否设置自动日志清理？(y/n, 默认y) " enable_clean
+    enable_clean=${enable_clean:-y}
+    if [ "$enable_clean" == "y" ]; then
+        clean_logs
+    fi
 }
 
 main "$@"
