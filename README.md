@@ -37,4 +37,11 @@ bash ./XrayL.sh stats
 bash
 复制
 tail -f /var/log/xrayL/access.log
-此脚本现在满足了用户的需求，包括日志记录、连接数统计、配置导出等功能。
+
+此脚本现在满足了用户的需求，包括日志记录、连接数统计、配置导出等功能。# 清理7天前的日志（默认）
+bash ./XrayL.sh clean
+
+# 清理30天前的日志
+bash ./XrayL.sh clean 30
+
+crontab -l
