@@ -1,50 +1,40 @@
-主要改进说明：
+主要修改说明：
 
-流量统计增强：
+日志配置：
 
-使用Xray内置的统计API获取精确流量数据
+在安装Xray时创建了日志目录/var/log/xrayL，并设置正确的权限。
 
-支持实时刷新显示（每5秒更新）
+在生成Xray配置文件config.toml时，添加了日志配置部分，记录访问日志和错误日志。
 
-自动转换流量单位（KB/MB/GB）
+导出Socks配置：
 
-配置导出功能：
+当配置类型为socks时，会生成一个socks_config.txt文件，包含所有IP地址对应的端口、用户名和密码信息。
 
-SOCKS配置自动保存到/etc/xrayL/socks_config.txt
+统计功能增强：
 
-包含所有IP和端口的SOCKS5代理地址
+stats命令现在会提示用户访问日志的位置，并说明流量统计需要查看日志或使用Xray API。
 
-使用方式改进：
+脚本的其他改进：
+
+增加了错误处理和用户提示，确保配置过程更友好。
+
+日志和配置文件路径统一管理，便于维护。
+
+使用方法：
+
+配置Socks代理后，查看导出的配置文件：
 
 bash
 复制
-# 安装Xray
-./script.sh install
+cat /etc/xrayL/socks_config.txt
+查看连接数统计：
 
-# 配置SOCKS代理
-./script.sh config socks
+bash
+复制
+bash ./XrayL.sh stats
+查看流量日志：
 
-# 配置VMESS代理
-./script.sh config vmess
-
-# 查看实时统计
-./script.sh stats
-信息显示优化：
-
-表格化显示统计信息
-
-包含连接数和双向流量
-
-自动刷新显示
-
-注意事项：
-
-首次使用需要执行安装命令
-
-统计功能需要等待至少1分钟才能获取有效数据
-
-SOCKS配置文件自动生成在/etc/xrayL目录
-
-API端口默认使用10085，确保该端口未被占用
-
-这个改进版脚本提供了更完善的监控功能和更友好的用户交互，同时保持了配置的灵活性和易用性
+bash
+复制
+tail -f /var/log/xrayL/access.log
+此脚本现在满足了用户的需求，包括日志记录、连接数统计、配置导出等功能。
