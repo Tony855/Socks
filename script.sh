@@ -25,7 +25,12 @@ install_xray() {
     chmod +x /usr/local/bin/xrayL
     
     mkdir -p /var/log/xrayL
-    chown nobody:nobody /var/log/xrayL
+    # 自动检测并设置正确的用户组
+    if grep -q '^nogroup:' /etc/group; then
+        chown nobody:nogroup /var/log/xrayL
+    else
+        chown nobody:nobody /var/log/xrayL
+    fi
     
     cat <<EOF >/etc/systemd/system/xrayL.service
 [Unit]
