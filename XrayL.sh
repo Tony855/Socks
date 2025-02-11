@@ -17,7 +17,7 @@ fi
 install_xray() {
     echo "安装 Xray..."
     apt-get install unzip -y || yum install unzip -y
-    wget https://github.com/XTLS/Xray-core/releases/download/v25.1.1/Xray-linux-64.zip
+    wget https://github.com/XTLS/Xray-core/releases/download/v25.1.30/Xray-linux-64.zip
     unzip Xray-linux-64.zip
     mv xray /usr/local/bin/xrayL
     chmod +x /usr/local/bin/xrayL
@@ -48,6 +48,7 @@ config_xray() {
     # 保存配置信息
     save_port_info() {
         echo "START_PORT=$START_PORT" > /etc/xrayL/portinfo
+        echo "END_PORT=$((START_PORT + ${#IP_ADDRESSES[@]} - 1))" >> /etc/xrayL/portinfo
         echo "NUM_IPS=${#IP_ADDRESSES[@]}" >> /etc/xrayL/portinfo
         echo "IP_ADDRESSES=\"${IP_ADDRESSES[*]}\"" >> /etc/xrayL/portinfo
     }
@@ -61,11 +62,9 @@ config_xray() {
     START_PORT=${START_PORT:-$DEFAULT_START_PORT}
     
     if [ "$config_type" == "socks" ]; then
-        read -p "SOCKS 账号 (默认 $DEFAULT_SOCKS_USERNAME): " SOCKS_USERNAME
-        SOCKS_USERNAME=${SOCKS_USERNAME:-$DEFAULT_SOCKS_USERNAME}
-
-        read -p "SOCKS 密码 (默认 $DEFAULT_SOCKS_PASSWORD): " SOCKS_PASSWORD
-        SOCKS_PASSWORD=${SOCKS_PASSWORD:-$DEFAULT_SOCKS_PASSWORD}
+        # 固定用户名和密码
+        SOCKS_USERNAME=$DEFAULT_SOCKS_USERNAME
+        SOCKS_PASSWORD=$DEFAULT_SOCKS_PASSWORD
     elif [ "$config_type" == "vmess" ]; then
         read -p "UUID (默认随机): " UUID
         UUID=${UUID:-$DEFAULT_UUID}
@@ -106,6 +105,18 @@ config_xray() {
     echo -e "$config_content" >/etc/xrayL/config.toml
     systemctl restart xrayL.service
     save_port_info  # 保存端口和IP信息
+    
+    if [ "$config_type" == "socks" ]; then
+        # 导出socks配置到文件
+        SOCKS_CONFIG_FILE="/etc/xrayL/socks_config.txt"
+        echo "SOCKS 配置信息：" > $SOCKS_CONFIG_FILE
+        for ((i = 0; i < ${#IP_ADDRESSES[@]}; i++)); do
+            port=$((START_PORT + i))
+            echo "地址: ${IP_ADDRESSES[i]}:$port, 用户名: $SOCKS_USERNAME, 密码: $SOCKS_PASSWORD" >> $SOCKS_CONFIG_FILE
+        done
+        echo "SOCKS 配置已保存至 $SOCKS_CONFIG_FILE"
+    fi
+    
     systemctl --no-pager status xrayL.service
     echo ""
     echo "生成 $config_type 配置完成"
@@ -127,14 +138,16 @@ stats() {
         exit 1
     fi
     START_PORT=$(grep 'START_PORT' /etc/xrayL/portinfo | cut -d= -f2)
-    NUM_IPS=$(grep 'NUM_IPS' /etc/xrayL/portinfo | cut -d= -f2)
+    END_PORT=$(grep 'END_PORT' /etc/xrayL/portinfo | cut -d= -f2)
     IP_ADDRESSES_STR=$(grep 'IP_ADDRESSES' /etc/xrayL/portinfo | cut -d= -f2)
     IP_ADDRESSES=($IP_ADDRESSES_STR)
-    echo "统计各出口IP的连接数："
+    STATS_FILE="/etc/xrayL/stats.log"
+    echo "统计时间: $(date)" | tee $STATS_FILE
+    echo "统计各出口IP的连接数：" | tee -a $STATS_FILE
     for i in "${!IP_ADDRESSES[@]}"; do
         port=$((START_PORT + i))
         count=$(ss -antp sport = :$port | grep 'xrayL' | grep -c ESTAB)
-        echo "IP: ${IP_ADDRESSES[i]}, 端口: $port, 连接数: $count"
+        echo "IP: ${IP_ADDRESSES[i]}, 端口: $port, 连接数: $count" | tee -a $STATS_FILE
     done
 }
 
