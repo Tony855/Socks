@@ -1,14 +1,4 @@
 #!/bin/bash
-#
-# Multi-Instance WireGuard Installer
-# 功能：
-#   1. 预设IPv6子网，每个实例配置绑定不同IPv6（自动根据网卡上该子网内的IPv6数量生成配置）
-#   2. 每个实例采用不同内部IPv4子网（10.7.X.0/24，服务器IP为10.7.X.1），但客户端连接时均使用服务器公网IPv4
-#   3. 监听端口从 BASE_PORT 开始依次递增
-#
-# 参考 https://github.com/hwdsl2/wireguard-install
-#
-# Released under the MIT License
 
 ############################ 辅助函数 ############################
 
