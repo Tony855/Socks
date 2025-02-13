@@ -725,7 +725,7 @@ create_server_config() {
 # ENDPOINT $([[ -n "$public_ip" ]] && echo "$public_ip" || echo "$ip")
 
 [Interface]
-Address = 10.7.0.1/24$([[ -n "$ip6" ]] && echo ", fddd:2c4:2c4:2c4::1/64")
+Address = 10.7.0.1/24, ${selected_ipv6}/64
 PrivateKey = $(wg genkey)
 ListenPort = $port
 
