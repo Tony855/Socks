@@ -1,185 +1,148 @@
 #!/bin/bash
 #
-# Modified WireGuard Installer
-# 整合预设IPv6子网，每个配置绑定不同IPv6，自动根据网卡IPv6数量生成配置
+# Multi-Instance WireGuard Installer
+# 功能：
+#   1. 预设IPv6子网，每个实例配置绑定不同IPv6（自动根据网卡上该子网内的IPv6数量生成配置）
+#   2. 每个实例采用不同内部IPv4子网（10.7.X.0/24，服务器IP为10.7.X.1），但客户端连接时均使用服务器公网IPv4
+#   3. 监听端口从 BASE_PORT 开始依次递增
 #
 # 参考 https://github.com/hwdsl2/wireguard-install
 #
-# Copyright (c) 2022-2024 Lin Song
-# Copyright (c) 2020-2023 Nyr
-#
 # Released under the MIT License
 
-exiterr()  { echo "Error: $1" >&2; exit 1; }
-exiterr2() { exiterr "'apt-get install' failed."; }
-exiterr3() { exiterr "'yum install' failed."; }
-exiterr4() { exiterr "'zypper install' failed."; }
+############################ 辅助函数 ############################
 
-# -------------------------- 全局预设变量 --------------------------
-# 预设IPv6子网（可根据需要修改）
-PRESET_IPV6_SUBNET="fddd:2c4:2c4:2c4::/64"
-# WireGuard 内部IPv4（固定用于客户端连接时作为服务器IP）
-SERVER_VPN_IPV4="10.7.0.1/24"
-# 默认基础监听端口
-BASE_PORT=51820
+exiterr() { echo "Error: $1" >&2; exit 1; }
 
-# -------------------------- 检查与工具函数 --------------------------
 check_ip() {
-	IP_REGEX='^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
-	printf '%s' "$1" | tr -d '\n' | grep -Eq "$IP_REGEX"
-}
-
-check_dns_name() {
-	FQDN_REGEX='^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
-	printf '%s' "$1" | tr -d '\n' | grep -Eq "$FQDN_REGEX"
+    IP_REGEX='^(([0-9]{1,3}\.){3}[0-9]{1,3})$'
+    printf '%s' "$1" | tr -d '\n' | grep -Eq "$IP_REGEX"
 }
 
 check_root() {
-	if [ "$(id -u)" != 0 ]; then
-		exiterr "This installer must be run as root. Try 'sudo bash $0'"
-	fi
-}
-
-check_shell() {
-	if readlink /proc/$$/exe | grep -q "dash"; then
-		exiterr 'This installer needs to be run with "bash", not "sh".'
-	fi
-}
-
-check_kernel() {
-	if [[ $(uname -r | cut -d "." -f 1) -eq 2 ]]; then
-		exiterr "The system is running an old kernel, which is incompatible with this installer."
-	fi
-}
-
-# ...（原有检测操作系统、容器等函数保持不变） ...
-
-# -------------------------- 新增：检测预设IPv6地址 --------------------------
-detect_ipv6_addrs() {
-    # 从网卡中查找属于预设子网的IPv6地址（假设地址前缀匹配即可）
-    ipv6_list=($(ip -6 addr show | grep -oE "$(echo $PRESET_IPV6_SUBNET | sed 's/\/64//')(:[0-9a-fA-F]{1,4})?" ))
-    if [ ${#ipv6_list[@]} -eq 0 ]; then
-        # 若未检测到，则默认使用子网中第一个地址
-        ipv6_list=("$(echo $PRESET_IPV6_SUBNET | sed 's/\/64//')1")
+    if [ "$(id -u)" != 0 ]; then
+        exiterr "必须以 root 用户运行此脚本，请使用 sudo。"
     fi
 }
 
-# -------------------------- 修改：生成多实例服务器配置 --------------------------
+# 检测服务器公网IPv4（用于客户端连接的固定服务器IP）
+get_public_ipv4() {
+    pub_ip=$(ip -4 route get 1 2>/dev/null | awk '{print $NF; exit}')
+    if ! check_ip "$pub_ip"; then
+        exiterr "无法检测到服务器公网IPv4地址。"
+    fi
+    echo "$pub_ip"
+}
+
+# 根据预设IPv6子网，检测网卡上所有匹配的IPv6地址
+detect_ipv6_addrs() {
+    # 预设IPv6子网（注意：/64仅用于匹配前缀）
+    local preset_prefix="${PRESET_IPV6_SUBNET%/*}"
+    # 从 ip 命令中提取所有全局IPv6地址
+    mapfile -t ipv6_list < <(ip -6 addr show scope global | grep -oE '([0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}' | grep "^${preset_prefix}")
+    if [ ${#ipv6_list[@]} -eq 0 ]; then
+        # 若未检测到，则默认使用预设子网的第一个地址（末尾加 1）
+        ipv6_list=("${preset_prefix}1")
+    fi
+    echo "${ipv6_list[@]}"
+}
+
+# 生成随机私钥
+gen_private_key() {
+    wg genkey
+}
+
+############################ 全局变量 ############################
+
+# 预设IPv6子网（请根据需要修改）
+PRESET_IPV6_SUBNET="fddd:2c4:2c4:2c4::/64"
+# 默认基础监听端口
+BASE_PORT=51820
+# WireGuard 配置存放目录
+WG_CONFIG_DIR="/etc/wireguard"
+mkdir -p "${WG_CONFIG_DIR}"
+
+# 用于分配内部IPv4子网，各实例采用 10.7.X.0/24，服务器 IP 为 10.7.X.1
+# 例如：实例 0 → 10.7.0.0/24，实例 1 → 10.7.1.0/24，依此类推
+
+############################ 生成配置 ############################
+
 create_server_configs() {
-    detect_ipv6_addrs
-    index=0
-    mkdir -p /etc/wireguard
+    # 检测预设子网内的IPv6地址列表
+    ipv6_list=($(detect_ipv6_addrs))
+    num_instances=${#ipv6_list[@]}
+    echo "检测到 ${num_instances} 个符合预设子网 ${PRESET_IPV6_SUBNET} 的IPv6地址："
     for ip6 in "${ipv6_list[@]}"; do
-        config_file="/etc/wireguard/wg${index}.conf"
-        port=$((BASE_PORT + index))
-        server_private_key=$(wg genkey)
-        cat << EOF > "$config_file"
-# 自动生成的WireGuard配置
-# 服务器公网IP：\$ip
+        echo "  ${ip6}"
+    done
+    echo
+
+    # 获取服务器公网IPv4（客户端连接时固定使用该IP）
+    public_ipv4=$(get_public_ipv4)
+
+    # 遍历生成每个实例的配置
+    for ((i=0; i<num_instances; i++)); do
+        WG_CONF="${WG_CONFIG_DIR}/wg${i}.conf"
+        # 每个实例采用不同内部IPv4子网：10.7.i.0/24，服务器IP 10.7.i.1
+        server_vpn_ipv4="10.7.${i}.1/24"
+        # 当前实例绑定的IPv6（确保带 /64 掩码）
+        server_ipv6="${ipv6_list[$i]}/64"
+        # 监听端口从 BASE_PORT 开始递增
+        port=$(( BASE_PORT + i ))
+        # 生成服务器私钥
+        server_priv_key=$(gen_private_key)
+        # 写入配置文件
+        cat << EOF > "$WG_CONF"
+# 自动生成的 WireGuard 配置：实例 wg${i}
+# 客户端连接时请使用服务器公网IP ${public_ipv4} 和端口 ${port}
 [Interface]
-Address = ${SERVER_VPN_IPV4}, ${ip6}/64
-PrivateKey = ${server_private_key}
+Address = ${server_vpn_ipv4}, ${server_ipv6}
+PrivateKey = ${server_priv_key}
 ListenPort = ${port}
+
+# （可在此处添加其他自定义参数，例如 MTU、DNS 等）
 EOF
-        chmod 600 "$config_file"
-        echo "生成配置：$config_file 绑定IPv6: ${ip6} 端口: ${port}"
-        index=$((index+1))
+        chmod 600 "$WG_CONF"
+        echo "生成配置：$WG_CONF"
+        echo "  内部VPN地址：${server_vpn_ipv4}"
+        echo "  绑定IPv6地址：${server_ipv6}"
+        echo "  监听端口：${port}"
+        echo "  客户端连接时使用的服务器IP：${public_ipv4}"
+        echo
     done
 }
 
-# -------------------------- 修改：防火墙规则设置 --------------------------
+############################ 防火墙与服务启动（可选） ############################
+
 create_firewall_rules() {
-    detect_ipv6_addrs
-    index=0
-    for ip6 in "${ipv6_list[@]}"; do
-        port=$((BASE_PORT + index))
-        if systemctl is-active --quiet firewalld.service; then
-            firewall-cmd -q --add-port="${port}"/udp
-            firewall-cmd -q --zone=trusted --add-source=10.7.0.0/24
-            firewall-cmd -q --permanent --add-port="${port}"/udp
-            firewall-cmd -q --permanent --zone=trusted --add-source=10.7.0.0/24
-            firewall-cmd -q --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
-            firewall-cmd -q --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
-            # 为IPv6增加对应规则（注意：这里假设 /64 掩码）
-            firewall-cmd -q --zone=trusted --add-source="${ip6}/64"
-            firewall-cmd -q --permanent --zone=trusted --add-source="${ip6}/64"
-            firewall-cmd -q --direct --add-rule ipv6 nat POSTROUTING 0 -s "${ip6}/64" ! -d "${ip6}/64" -j MASQUERADE
-            firewall-cmd -q --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s "${ip6}/64" ! -d "${ip6}/64" -j MASQUERADE
-        else
-            # 这里可添加iptables规则（略）
-            :
-        fi
-        index=$((index+1))
-    done
+    echo "请根据生成的实例配置（/etc/wireguard/wg*.conf）添加相应的防火墙规则。"
+    # 此处可根据实际环境自动添加防火墙规则，例如使用 firewall-cmd 或 iptables
 }
 
-# -------------------------- 修改：启动所有WireGuard实例 --------------------------
 start_wg_services() {
-    detect_ipv6_addrs
-    index=0
-    for ip6 in "${ipv6_list[@]}"; do
-        wg_service="wg-quick@wg${index}.service"
-        systemctl enable --now "$wg_service" >/dev/null 2>&1 || exiterr "无法启动服务 $wg_service"
-        echo "启动服务: $wg_service"
-        index=$((index+1))
+    # 启动所有生成的 WireGuard 实例服务
+    ipv6_list=($(detect_ipv6_addrs))
+    num_instances=${#ipv6_list[@]}
+    for ((i=0; i<num_instances; i++)); do
+        svc="wg-quick@wg${i}.service"
+        systemctl enable --now "$svc" >/dev/null 2>&1 || echo "无法启动服务 $svc"
+        echo "启动服务：$svc"
     done
 }
 
-# -------------------------- 其他原有函数保持不变 --------------------------
-# 如：install_wget、install_iproute、check_os、parse_args、show_header、show_usage 等
-# 客户端管理部分默认仍操作 wg0（如需全多实例管理，可进一步扩展）
+############################ 主流程 ############################
 
-# 示例：修改后安装流程，仅针对新安装（不含添加/移除客户端等操作）
-wgsetup() {
-
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-check_root
-check_shell
-check_kernel
-# 调用原有 check_os 等函数……
-# 此处省略其他原有检测逻辑
-
-# 检测公网IPv4
-ip=""
-if [[ $(ip -4 addr | grep inet | grep -vEc '127(\.[0-9]{1,3}){3}') -eq 1 ]]; then
-	ip=$(ip -4 addr | grep inet | grep -vE '127(\.[0-9]{1,3}){3}' | cut -d '/' -f 1)
-else
-	ip=$(ip -4 route get 1 | awk '{print $NF; exit}')
-fi
-if ! check_ip "$ip"; then
-	exiterr "无法检测到服务器公网IPv4地址。"
-fi
-
-# 自动安装提示（原有交互可保留或修改为全自动）
-echo "检测到服务器公网IPv4: $ip"
-echo "即将根据网卡中属于预设IPv6子网 $PRESET_IPV6_SUBNET 的地址生成配置。"
-echo
-
-# 安装必要软件包（保留原有安装函数）
-install_wget
-install_iproute
-# …（其他安装步骤）
-
-# 生成多个服务器配置文件（wg0.conf, wg1.conf, ...）
-create_server_configs
-
-# 更新系统转发设置（调用原有update_sysctl函数，此处不做修改）
-update_sysctl
-
-# 设置防火墙规则
-create_firewall_rules
-
-# 启动所有WireGuard实例
-start_wg_services
-
-echo
-echo "WireGuard安装完成！"
-echo "各实例配置文件存放在 /etc/wireguard/ 下，客户端连接时请使用固定公网IPv4 $ip 和相应端口（例如 ${BASE_PORT}、$((BASE_PORT+1)) 等）。"
-echo "注意：目前客户端管理（添加/删除客户端）默认仅针对 wg0，如需多实例管理请另行修改。"
+main() {
+    check_root
+    echo "开始生成 WireGuard 多实例配置……"
+    create_server_configs
+    create_firewall_rules
+    start_wg_services
+    echo
+    echo "WireGuard 配置生成完毕！"
+    echo "客户端连接时请使用服务器公网IPv4：$(get_public_ipv4) 和相应端口。"
 }
 
-## 主入口：根据传入参数调用相应操作，此处仅执行安装
-wgsetup "$@"
+main
 
 exit 0
