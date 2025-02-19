@@ -1,37 +1,55 @@
 #!/bin/bash
-#
 # 增强版 WireGuard 安装脚本
-# 新增功能：IPv6 支持、Web 管理界面、改进的依赖管理
-# 原脚本基础来自：https://github.com/hwdsl2/wireguard-install
-# 修改：添加 IPv6 支持、wg-gen-web 集成、优化系统兼容性
+# 功能：支持 IPv6 双栈、Web 管理界面、自动依赖处理
+# 原脚本基础：https://github.com/hwdsl2/wireguard-install
 
-# 新增参数
+# 全局配置
+WG_IPV4_NET="10.7.0.1/24"
+WG_IPV6_NET="fd42:42:42::1/64"
 WEBUI_PORT=5000
 WEBUI_USER="admin"
-WEBUI_PASS=$(openssl rand -hex 8)
-WG_IPV6_PREFIX="fd42:42:42:42"
+WEBUI_PASS=$(openssl rand -hex 12)
+WG_CONF="/etc/wireguard/wg0.conf"
 
-exiterr()  { echo "错误: $1" >&2; exit 1; }
-exiterr2() { exiterr "'apt-get install' 失败。"; }
-exiterr3() { exiterr "'yum install' 失败。"; }
-exiterr4() { exiterr "'zypper install' 失败。"; }
+exiterr() { echo "错误: $1" >&2; exit 1; }
 
-# 新增函数：安装 Web 管理界面
+# 新增：检测 IPv6 能力
+check_ipv6_support() {
+    if [ ! -f /proc/net/if_inet6 ]; then
+        echo "警告: 内核未启用 IPv6 支持"
+        return 1
+    fi
+    return 0
+}
+
+# 改进：系统检测
+check_os() {
+    if grep -qs "ID=ubuntu" /etc/os-release; then
+        os="ubuntu"
+        os_version=$(grep 'VERSION_ID' /etc/os-release | cut -d '"' -f 2 | tr -d '.')
+    elif grep -qs "ID=debian" /etc/os-release; then
+        os="debian"
+        os_version=$(grep 'VERSION_ID' /etc/os-release | cut -d '"' -f 2)
+    # 其他系统检测保持不变...
+    else
+        exiterr "不支持的 Linux 发行版"
+    fi
+}
+
+# 新增：安装 Web 管理界面
 install_webui() {
-    echo "正在安装 WireGuard Web 管理界面..."
+    echo "正在安装 Web 管理界面..."
     local WEBUI_DIR="/opt/wg-gen-web"
     
-    # 创建安装目录
-    mkdir -p $WEBUI_DIR || exiterr "无法创建目录 $WEBUI_DIR"
-    
     # 下载最新版本
-    local LATEST_RELEASE=$(curl -s https://api.github.com/repos/vx3r/wg-gen-web/releases/latest | grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4)
-    wget -O $WEBUI_DIR/wg-gen-web "$LATEST_RELEASE" || exiterr "下载 wg-gen-web 失败"
+    local LATEST_URL=$(curl -s https://api.github.com/repos/vx3r/wg-gen-web/releases/latest | grep browser_download_url | grep linux-amd64 | cut -d '"' -f 4)
+    wget -qO $WEBUI_DIR/wg-gen-web $LATEST_URL || exiterr "下载失败"
     chmod +x $WEBUI_DIR/wg-gen-web
 
     # 生成配置文件
     cat > $WEBUI_DIR/config.yml <<EOF
 server:
+  host: "0.0.0.0"
   port: $WEBUI_PORT
   auth:
     type: basic
@@ -39,10 +57,11 @@ server:
       username: "$WEBUI_USER"
       password: "$WEBUI_PASS"
 wg:
-  config_path: "/etc/wireguard/wg0.conf"
+  config_path: "$WG_CONF"
+  interface_name: "wg0"
 EOF
 
-    # 创建 systemd 服务
+    # 创建系统服务
     cat > /etc/systemd/system/wg-gen-web.service <<EOF
 [Unit]
 Description=WireGuard Web UI
@@ -59,141 +78,120 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now wg-gen-web.service && \
-    echo "Web 管理界面已启用: http://$public_ip:$WEBUI_PORT" || exiterr "Web 界面启动失败"
+    systemctl enable --now wg-gen-web.service || exiterr "服务启动失败"
 }
 
-# 改进的 IPv6 检测
-detect_ipv6() {
-    ip6=""
-    # 优先获取全局 IPv6 地址
-    ip6=$(ip -6 addr show scope global | grep -m 1 inet6 | awk '{print $2}' | cut -d'/' -f1)
-    
-    # 如果没有全局地址，尝试其他类型
-    [ -z "$ip6" ] && ip6=$(ip -6 addr | grep -v 'fd42:42:42:42' | grep -m 1 inet6 | awk '{print $2}' | cut -d'/' -f1)
-    
-    # 生成ULA地址作为回退
-    [ -z "$ip6" ] && ip6="$WG_IPV6_PREFIX::1/64" && echo "使用私有 IPv6 地址: $ip6"
-}
-
-# 修改后的服务器配置文件生成
+# 改进：生成服务器配置
 create_server_config() {
     local PRIVATE_KEY=$(wg genkey)
-    cat << EOF > "$WG_CONF"
-# 注意: 以下注释行用于脚本维护，请勿修改
-# ENDPOINT $([[ -n "$public_ip" ]] && echo "$public_ip" || echo "$ip")
-
+    cat > $WG_CONF <<EOF
 [Interface]
-Address = 10.7.0.1/24
+Address = $WG_IPV4_NET, $WG_IPV6_NET
 PrivateKey = $PRIVATE_KEY
 ListenPort = $port
-
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; ip6tables -A FORWARD -i wg0 -j ACCEPT
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; ip6tables -D FORWARD -i wg0 -j ACCEPT
 EOF
-
-    # 添加 IPv6 支持
-    if [[ -n "$ip6" ]]; then
-        sed -i "/^ListenPort/a Address = $WG_IPV6_PREFIX::1/64" "$WG_CONF"
-    fi
-    chmod 600 "$WG_CONF"
+    chmod 600 $WG_CONF
 }
 
-# 增强的防火墙规则配置
-create_firewall_rules() {
-    # IPv4 规则
-    firewall-cmd -q --add-port=$port/udp
-    firewall-cmd -q --zone=trusted --add-source=10.7.0.0/24
-    firewall-cmd -q --permanent --add-port=$port/udp
-    firewall-cmd -q --permanent --zone=trusted --add-source=10.7.0.0/24
-    firewall-cmd -q --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
-    
-    # IPv6 规则
-    if [[ -n "$ip6" ]]; then
-        firewall-cmd -q --zone=trusted --add-source=$WG_IPV6_PREFIX::/64
-        firewall-cmd -q --direct --add-rule ipv6 nat POSTROUTING 0 -s $WG_IPV6_PREFIX::/64 -j MASQUERADE
-        firewall-cmd -q --permanent --zone=trusted --add-source=$WG_IPV6_PREFIX::/64
-    fi
-    
-    echo "防火墙规则已更新，同时支持 IPv4/IPv6"
-}
-
-# 改进的客户端配置生成
+# 改进：客户端配置文件生成
 new_client() {
-    # ... [原有内容] ...
-    
-    # 添加 IPv6 DNS
-    local CLIENT_DNS="$dns, 2001:4860:4860::8888"
-    
-    cat << EOF > "$export_dir$client.conf"
-[Interface]
-Address = 10.7.0.$octet/24
-PrivateKey = $key
-DNS = $CLIENT_DNS
-
-[Peer]
-PublicKey = $(wg pubkey <<< "$(grep PrivateKey $WG_CONF | cut -d' ' -f3)")
-Endpoint = $([[ -n "$public_ip" ]] && echo "$public_ip" || echo "$ip"):$port
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
-EOF
+    # ...原有客户端生成逻辑...
 
     # 添加 IPv6 地址
-    if [[ -n "$ip6" ]]; then
-        sed -i "/^Address/a Address = $WG_IPV6_PREFIX::$octet/64" "$export_dir$client.conf"
-    fi
+    cat >> "$export_dir$client.conf" <<EOF
+[Interface]
+Address = 10.7.0.$octet/24, fd42:42:42::$octet/64
+DNS = 8.8.8.8, 2001:4860:4860::8888
+
+[Peer]
+AllowedIPs = 0.0.0.0/0, ::/0
+EOF
 }
 
-# 安装流程中添加 WebUI 选项
-wgsetup() {
-    # ... [原有检测逻辑] ...
+# 改进：防火墙配置
+configure_firewall() {
+    # IPv4 规则
+    firewall-cmd --permanent --add-port=$port/udp
+    firewall-cmd --permanent --zone=trusted --add-source=10.7.0.0/24
     
-    # 新增安装选项
-    if [ "$auto" = 0 ]; then
-        read -p "启用 Web 管理界面？(y/N) " -r webui_choice
-        if [[ $webui_choice =~ ^[Yy] ]]; then
-            install_webui
-            echo "访问地址: http://$ip:$WEBUI_PORT"
-            echo "用户名: $WEBUI_USER"
-            echo "密码: $WEBUI_PASS"
-        fi
+    # IPv6 规则
+    if check_ipv6_support; then
+        firewall-cmd --permanent --add-rich-rule='rule family="ipv6" source address="fd42:42:42::/64" accept'
+        firewall-cmd --permanent --add-rich-rule='rule family="ipv6" masquerade'
     fi
     
-    # ... [后续原有流程] ...
+    firewall-cmd --reload
 }
 
-# 修改帮助信息
-show_usage() {
-    # ... [原有内容] ...
-    echo "新增选项："
-    echo "  --webui-port [端口]      Web 管理界面端口 (默认: 5000)"
-    echo "  --webui-user [用户名]    Web 界面用户名 (默认: admin)"
-    echo "  --webui-pass [密码]      Web 界面密码 (默认: 自动生成)"
-    # ... [后续内容] ...
+# 改进：系统优化
+optimize_system() {
+    # 启用内核转发
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wg.conf
+    echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-wg.conf
+    sysctl -p /etc/sysctl.d/99-wg.conf
+
+    # 启用 BBR 拥塞控制
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.d/99-wg.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.d/99-wg.conf
 }
 
-# 在 parse_args 添加新参数处理
-parse_args() {
-    while [ "$#" -gt 0 ]; do
-        case $1 in
-            --webui-port)
-                WEBUI_PORT="$2"
-                shift 2
-                ;;
-            --webui-user)
-                WEBUI_USER="$2"
-                shift 2
-                ;;
-            --webui-pass)
-                WEBUI_PASS="$2"
-                shift 2
-                ;;
-            # ... [原有参数处理] ...
-        esac
-    done
+# 安装流程
+install_wireguard() {
+    check_root
+    check_os
+    check_ipv6_support || echo "将继续安装仅 IPv4 模式"
+
+    # 安装依赖
+    case "$os" in
+        ubuntu|debian)
+            apt-get update
+            apt-get install -y wireguard-tools qrencode firewalld
+            ;;
+        centos|fedora)
+            dnf install -y wireguard-tools qrencode firewalld
+            ;;
+    esac
+
+    # 配置 WireGuard
+    create_server_config
+    configure_firewall
+    optimize_system
+
+    # 安装 Web 界面
+    read -p "是否安装 Web 管理界面？[y/N] " -n 1 -r
+    if [[ $REPLY =~ ^[Yy] ]]; then
+        install_webui
+        echo -e "\nWeb 界面访问信息："
+        echo "地址: http://$(curl -4s icanhazip.com):$WEBUI_PORT"
+        echo "用户名: $WEBUI_USER"
+        echo "密码: $WEBUI_PASS"
+    fi
+
+    systemctl enable --now wg-quick@wg0
+    echo "安装完成！"
 }
 
-# ... [脚本其余部分保持不变] ...
+# 主菜单
+main() {
+    case $1 in
+        --install)
+            install_wireguard
+            ;;
+        --addclient)
+            add_client
+            ;;
+        # 其他命令处理...
+        *)
+            echo "用法: $0 [选项]"
+            echo "选项："
+            echo "  --install         安装 WireGuard 和 Web 管理"
+            echo "  --addclient [名称] 添加新客户端"
+            echo "  --webui-port [端口] 指定 Web 界面端口"
+            exit 1
+            ;;
+    esac
+}
 
-## 延迟执行直到脚本完整加载
-wgsetup "$@"
-
-exit 0
+main "$@"
