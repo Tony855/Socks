@@ -2,11 +2,13 @@
 
 DEFAULT_START_PORT=23049
 DEFAULT_SOCKS_USERNAME="socks@admin"
-DEFAULT_SOCKS_PASSWORD="1234567890"
-DEFAULT_WS_PATH="/ws"
-DEFAULT_UUID=$(cat /proc/sys/kernel/random/uuid)
+DEFAULT_SOCKS_PASSWORD="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)"
+DEFAULT_WEB_PORT=8080
+DEFAULT_ADMIN_USER="admin"
+DEFAULT_ADMIN_PASS="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)"
 
-IP_ADDRESSES=($(hostname -I))
+IPV4_ADDRESSES=($(hostname -I))
+IPV6_ADDRESSES=($(ip -6 addr show | grep inet6 | awk '{print $2}' | grep -v '^::' | grep -v '^fd' | cut -d'/' -f1))
 
 # 必须root权限
 if [ "$(id -u)" != "0" ]; then
@@ -14,22 +16,29 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
+install_dependencies() {
+    echo "安装系统依赖..."
+    apt-get update || yum update -y
+    apt-get install -y git nginx python3-venv python3-pip libssl-dev || yum install -y git nginx python3 python3-pip openssl-devel
+}
+
+setup_firewall() {
+    echo "配置防火墙..."
+    # 放行SSH、Web管理端口和Socks端口范围
+    ufw allow 22/tcp >/dev/null 2>&1
+    ufw allow $WEB_PORT/tcp >/dev/null 2>&1
+    ufw allow ${START_PORT}:$(($START_PORT + ${#ALL_IPS[@]} - 1))/tcp >/dev/null 2>&1
+    ufw --force enable >/dev/null 2>&1
+}
+
 install_xray() {
     echo "安装 Xray..."
-    apt-get install unzip -y || yum install unzip -y
-    wget https://github.com/XTLS/Xray-core/releases/download/v25.1.30/Xray-linux-64.zip
-    unzip Xray-linux-64.zip
+    wget -q https://github.com/XTLS/Xray-core/releases/download/v1.8.11/Xray-linux-64.zip
+    unzip -q Xray-linux-64.zip
     mv xray /usr/local/bin/xrayL
     chmod +x /usr/local/bin/xrayL
-    # 创建日志目录并设置权限
-    mkdir -p /var/log/xrayL
-    # 自动检测并设置正确的用户组
-    if grep -q '^nogroup:' /etc/group; then
-        chown nobody:nogroup /var/log/xrayL
-    else
-        chown nobody:nobody /var/log/xrayL
-    fi
-    
+
+    # 创建系统服务
     cat <<EOF >/etc/systemd/system/xrayL.service
 [Unit]
 Description=XrayL Service
@@ -44,182 +53,179 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
     systemctl enable xrayL.service
-    systemctl start xrayL.service
-    echo "Xray 安装完成."
 }
 
-config_xray() {
-    config_type=$1
-    mkdir -p /etc/xrayL
-    
-    # 保存配置信息
-    save_port_info() {
-        echo "START_PORT=$START_PORT" > /etc/xrayL/portinfo
-        echo "NUM_IPS=${#IP_ADDRESSES[@]}" >> /etc/xrayL/portinfo
-        echo "IP_ADDRESSES=\"${IP_ADDRESSES[*]}\"" >> /etc/xrayL/portinfo
-    }
+setup_webui() {
+    echo "安装Web管理界面..."
+    git clone https://github.com/yourorg/socks-admin-ui /opt/socks-admin
+    cd /opt/socks-admin || exit 1
 
-    if [ "$config_type" != "socks" ] && [ "$config_type" != "vmess" ]; then
-        echo "类型错误！仅支持socks和vmess."
-        exit 1
-    fi
+    # 创建Python虚拟环境
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install -r requirements.txt
 
-    read -p "起始端口 (默认 $DEFAULT_START_PORT): " START_PORT
-    START_PORT=${START_PORT:-$DEFAULT_START_PORT}
-    
-    if [ "$config_type" == "socks" ]; then
-        read -p "SOCKS 账号 (默认 $DEFAULT_SOCKS_USERNAME): " SOCKS_USERNAME
-        SOCKS_USERNAME=${SOCKS_USERNAME:-$DEFAULT_SOCKS_USERNAME}
+    # 生成安全密钥
+    SECRET_KEY=$(openssl rand -hex 32)
 
-        read -p "SOCKS 密码 (默认 $DEFAULT_SOCKS_PASSWORD): " SOCKS_PASSWORD
-        SOCKS_PASSWORD=${SOCKS_PASSWORD:-$DEFAULT_SOCKS_PASSWORD}
-    elif [ "$config_type" == "vmess" ]; then
-        read -p "UUID (默认随机): " UUID
-        UUID=${UUID:-$DEFAULT_UUID}
-        read -p "WebSocket 路径 (默认 $DEFAULT_WS_PATH): " WS_PATH
-        WS_PATH=${WS_PATH:-$DEFAULT_WS_PATH}
-    fi
-
-    # 构建配置文件内容
-    config_content="[log]\n"
-    config_content+="loglevel = \"info\"\n"
-    config_content+="access = \"/var/log/xrayL/access.log\"\n"
-    config_content+="error = \"/var/log/xrayL/error.log\"\n\n"
-
-    for ((i = 0; i < ${#IP_ADDRESSES[@]}; i++)); do
-        config_content+="[[inbounds]]\n"
-        config_content+="port = $((START_PORT + i))\n"
-        config_content+="protocol = \"$config_type\"\n"
-        config_content+="tag = \"tag_$((i + 1))\"\n"
-        config_content+="[inbounds.settings]\n"
-        if [ "$config_type" == "socks" ]; then
-            config_content+="auth = \"password\"\n"
-            config_content+="udp = true\n"
-            config_content+="ip = \"${IP_ADDRESSES[i]}\"\n"
-            config_content+="[[inbounds.settings.accounts]]\n"
-            config_content+="user = \"$SOCKS_USERNAME\"\n"
-            config_content+="pass = \"$SOCKS_PASSWORD\"\n"
-        elif [ "$config_type" == "vmess" ]; then
-            config_content+="[[inbounds.settings.clients]]\n"
-            config_content+="id = \"$UUID\"\n"
-            config_content+="[inbounds.streamSettings]\n"
-            config_content+="network = \"ws\"\n"
-            config_content+="[inbounds.streamSettings.wsSettings]\n"
-            config_content+="path = \"$WS_PATH\"\n\n"
-        fi
-        config_content+="[[outbounds]]\n"
-        config_content+="sendThrough = \"${IP_ADDRESSES[i]}\"\n"
-        config_content+="protocol = \"freedom\"\n"
-        config_content+="tag = \"tag_$((i + 1))\"\n\n"
-        config_content+="[[routing.rules]]\n"
-        config_content+="type = \"field\"\n"
-        config_content+="inboundTag = \"tag_$((i + 1))\"\n"
-        config_content+="outboundTag = \"tag_$((i + 1))\"\n\n\n"
-    done
-    echo -e "$config_content" >/etc/xrayL/config.toml
-    systemctl restart xrayL.service
-    save_port_info  # 保存端口和IP信息
-
-    # 导出Socks配置信息到文件
-    if [ "$config_type" == "socks" ]; then
-        SOCKS_CONFIG_FILE="/etc/xrayL/socks_config.txt"
-        echo "=== Socks 配置信息 ===" > $SOCKS_CONFIG_FILE
-        for ((i = 0; i < ${#IP_ADDRESSES[@]}; i++)); do
-            port=$((START_PORT + i))
-            echo "服务器: ${IP_ADDRESSES[i]}" >> $SOCKS_CONFIG_FILE
-            echo "端口: $port" >> $SOCKS_CONFIG_FILE
-            echo "用户名: $SOCKS_USERNAME" >> $SOCKS_CONFIG_FILE
-            echo "密码: $SOCKS_PASSWORD" >> $SOCKS_CONFIG_FILE
-            echo "" >> $SOCKS_CONFIG_FILE
-        done
-        echo "Socks配置已导出至 $SOCKS_CONFIG_FILE"
-    fi
-
-    systemctl --no-pager status xrayL.service
-    echo ""
-    echo "生成 $config_type 配置完成"
-    echo "起始端口:$START_PORT"
-    echo "结束端口:$(($START_PORT + ${#IP_ADDRESSES[@]} - 1))"
-    if [ "$config_type" == "socks" ]; then
-        echo "socks账号:$SOCKS_USERNAME"
-        echo "socks密码:$SOCKS_PASSWORD"
-    elif [ "$config_type" == "vmess" ]; then
-        echo "UUID:$UUID"
-        echo "ws路径:$WS_PATH"
-    fi
-    echo ""
-}
-
-stats() {
-    if [ ! -f /etc/xrayL/portinfo ]; then
-        echo "未找到端口信息，请先配置Xray"
-        exit 1
-    fi
-    START_PORT=$(grep 'START_PORT' /etc/xrayL/portinfo | cut -d= -f2)
-    NUM_IPS=$(grep 'NUM_IPS' /etc/xrayL/portinfo | cut -d= -f2)
-    IP_ADDRESSES_STR=$(grep 'IP_ADDRESSES' /etc/xrayL/portinfo | cut -d= -f2)
-    IP_ADDRESSES=($IP_ADDRESSES_STR)
-    echo "统计各出口IP的连接数："
-    for i in "${!IP_ADDRESSES[@]}"; do
-        port=$((START_PORT + i))
-        count=$(ss -antp sport = :$port | grep 'xrayL' | grep -c ESTAB)
-        echo "IP: ${IP_ADDRESSES[i]}, 端口: $port, 连接数: $count"
-    done
-    echo "访问日志位于: /var/log/xrayL/access.log"
-    echo "流量统计请查看日志或使用Xray API进行查询。"
-}
-
-clean_logs() {
-    read -p "请输入要保留日志的天数（默认7天）: " keep_days
-    keep_days=${keep_days:-7}
-    
-    # 创建自动清理脚本
-    cat <<EOF > /etc/xrayL/cleanlog.sh
-#!/bin/bash
-# 自动删除超过指定天数的日志
-find /var/log/xrayL -name "*.log" -type f -mtime +$keep_days -delete
+    # 创建配置文件
+    cat <<EOF >.env
+DEBUG=0
+DATABASE_URL=sqlite:////var/lib/socks-admin/socks.db
+SECRET_KEY=$SECRET_KEY
+XRAY_CONFIG=/etc/xrayL/config.toml
+ADMIN_USER=$ADMIN_USER
+ADMIN_PASS=$ADMIN_PASS
 EOF
 
-    chmod +x /etc/xrayL/cleanlog.sh
-    
-    # 添加cron任务（每天凌晨3点执行）
-    (crontab -l 2>/dev/null | grep -v "/etc/xrayL/cleanlog.sh"; echo "0 3 * * * /etc/xrayL/cleanlog.sh") | crontab -
-    
-    echo "已设置每天自动清理$keep_days天前的日志"
+    # 初始化数据库
+    flask db upgrade
+
+    # 创建系统服务
+    cat <<EOF >/etc/systemd/system/socks-admin.service
+[Unit]
+Description=Socks Admin Service
+After=network.target
+
+[Service]
+User=www-data
+WorkingDirectory=/opt/socks-admin
+Environment="PATH=/opt/socks-admin/venv/bin"
+ExecStart=/opt/socks-admin/venv/bin/gunicorn -b 127.0.0.1:5000 wsgi:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 配置Nginx
+    cat <<EOF >/etc/nginx/sites-available/socks-admin
+server {
+    listen $WEB_PORT ssl;
+    server_name $(hostname);
+
+    ssl_certificate /etc/ssl/certs/socks-admin.crt;
+    ssl_certificate_key /etc/ssl/private/socks-admin.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+EOF
+
+    # 生成自签名证书
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/socks-admin.key \
+        -out /etc/ssl/certs/socks-admin.crt \
+        -subj "/CN=$(hostname)"
+
+    ln -s /etc/nginx/sites-available/socks-admin /etc/nginx/sites-enabled/
+    systemctl restart nginx
+    systemctl enable socks-admin.service
+    systemctl start socks-admin.service
+}
+
+generate_config() {
+    echo "生成Xray配置文件..."
+    mkdir -p /etc/xrayL
+    ALL_IPS=("${IPV4_ADDRESSES[@]}" "${IPV6_ADDRESSES[@]}")
+
+    # 生成配置文件内容
+    CONFIG_CONTENT="[log]
+loglevel = \"info\"
+access = \"/var/log/xrayL/access.log\"
+error = \"/var/log/xrayL/error.log\"
+
+"
+
+    for i in "${!ALL_IPS[@]}"; do
+        PORT=$((START_PORT + i))
+        IP=${ALL_IPS[$i]}
+        
+        # IPv6地址需要加方括号
+        if [[ $IP == *:* ]]; then
+            IP_FORMAT="[${IP}]"
+        else
+            IP_FORMAT="${IP}"
+        fi
+
+        CONFIG_CONTENT+="[[inbounds]]
+port = ${PORT}
+protocol = \"socks\"
+tag = \"in_${i}\"
+listen = \"${IP}\"
+
+[inbounds.settings]
+auth = \"password\"
+udp = true
+
+[[inbounds.settings.accounts]]
+user = \"${SOCKS_USERNAME}\"
+pass = \"${SOCKS_PASSWORD}\"
+
+[[outbounds]]
+protocol = \"freedom\"
+tag = \"out_${i}\"
+sendThrough = \"${IP_FORMAT}\"
+
+[[routing.rules]]
+type = \"field\"
+inboundTag = \"in_${i}\"
+outboundTag = \"out_${i}\"
+
+"
+    done
+
+    echo -e "$CONFIG_CONTENT" > /etc/xrayL/config.toml
+    systemctl restart xrayL.service
 }
 
 main() {
-    if [ "$1" == "stats" ]; then
-        stats
-        exit 0
-    elif [ "$1" == "clean" ]; then  # 新增清理命令
-        clean_logs
-        exit 0
-    fi
-    
-    [ -x "$(command -v xrayL)" ] || install_xray
-    
-    # 在配置完成后询问是否设置自动清理
-    if [ $# -eq 1 ]; then
-        config_type="$1"
-    else
-        read -p "选择生成的节点类型 (socks/vmess): " config_type
-    fi
-    
-    case $config_type in
-        socks) config_xray "socks" ;;
-        vmess) config_xray "vmess" ;;
-        *) echo "未正确选择类型，使用默认socks配置."; config_xray "socks" ;;
-    esac
-    
-    # 新增自动清理设置询问
-    read -p "是否设置自动日志清理？(y/n, 默认y) " enable_clean
-    enable_clean=${enable_clean:-y}
-    if [ "$enable_clean" == "y" ]; then
-        clean_logs
-    fi
+    install_dependencies
+    setup_firewall
+
+    # 用户输入配置参数
+    read -p "请输入起始端口 (默认 ${DEFAULT_START_PORT}): " START_PORT
+    START_PORT=${START_PORT:-$DEFAULT_START_PORT}
+
+    read -p "请输入Socks账号 (默认 ${DEFAULT_SOCKS_USERNAME}): " SOCKS_USERNAME
+    SOCKS_USERNAME=${SOCKS_USERNAME:-$DEFAULT_SOCKS_USERNAME}
+
+    read -p "请输入Socks密码 (随机生成): " SOCKS_PASSWORD
+    SOCKS_PASSWORD=${SOCKS_PASSWORD:-$DEFAULT_SOCKS_PASSWORD}
+
+    read -p "请输入Web管理端口 (默认 ${DEFAULT_WEB_PORT}): " WEB_PORT
+    WEB_PORT=${WEB_PORT:-$DEFAULT_WEB_PORT}
+
+    read -p "请输入管理员账号 (默认 ${DEFAULT_ADMIN_USER}): " ADMIN_USER
+    ADMIN_USER=${ADMIN_USER:-$DEFAULT_ADMIN_USER}
+
+    read -p "请输入管理员密码 (随机生成): " ADMIN_PASS
+    ADMIN_PASS=${ADMIN_PASS:-$DEFAULT_ADMIN_PASS}
+
+    install_xray
+    setup_webui
+    generate_config
+
+    echo ""
+    echo "安装完成！"
+    echo "==============================="
+    echo "Socks配置信息："
+    echo "用户名: ${SOCKS_USERNAME}"
+    echo "密码: ${SOCKS_PASSWORD}"
+    echo "端口范围: ${START_PORT}-$(($START_PORT + ${#ALL_IPS[@]} - 1))"
+    echo ""
+    echo "Web管理界面："
+    echo "地址: https://$(hostname):${WEB_PORT}"
+    echo "管理员账号: ${ADMIN_USER}"
+    echo "管理员密码: ${ADMIN_PASS}"
+    echo ""
+    echo "防火墙已放行端口：22, ${WEB_PORT}, ${START_PORT}-$(($START_PORT + ${#ALL_IPS[@]} - 1))"
 }
 
-main "$@"
+main
